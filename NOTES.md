@@ -14,3 +14,8 @@
 5. **No Multi-Assignment in Ground Truth:** In train ground truth, 0 target IDs are shared across multiple S1 entities (1-to-1 match assignment pattern per target).
 6. **No Missing Ground Truth IDs:** All IDs in `train_ground_truth.tsv` exist in the respective source files.
 
+## Phase 2: Repository Setup & Remote Sync
+- Initialized local git repository on branch `main`.
+- Extended `.gitignore` to protect datasets, mini datasets, logs, virtual environments, parquet/pickle artifacts, __pycache__, and `.DS_Store`.
+- Verified 0 large files (>50 MB) and 0 data files staged before commit.
+- Linked remote origin `https://github.com/Daddy-Dagger/amazonML26.git` and successfully pushed initial setup to `origin/main`.
