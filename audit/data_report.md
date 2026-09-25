@@ -126,7 +126,7 @@
 7. **Non-ASCII Characters Across Sources:** Up to several percent of records have non-ASCII characters; unidecode and unicode normalization are mandatory.
 8. **Inconsistent Postal Code Presence:** Address PIN codes are missing in a significant fraction of records; blocking cannot rely solely on postal codes.
 9. **Legal Suffix Prevalence:** Tokens like LLC, INC, PVT, LTD dominate name tokens and can cause false positive fuzzy matches without domain suffix stripping.
-10. **Target ID Multi-Assignment:** 0 S2 IDs and 0 S3 IDs are matched to multiple S1 entities; 1-to-1 matching constraints must NOT be enforced.
+10. **Target ID Multi-Assignment:** Each S2/S3 record belongs to at most one S1 entity (0 multi-assigned), so our decision layer MUST assign every S2/S3 record to at most one S1 entity. (One S1 entity can still have many matches.)
 
 ## 8. Validator Rules (validate_submission.py)
 

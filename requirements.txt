@@ -12,3 +12,5 @@ six==1.17.0
 threadpoolctl==3.7.0
 tzdata==2026.4
 Unidecode==1.4.0
+duckdb==1.4.5
+pyarrow==21.0.0
