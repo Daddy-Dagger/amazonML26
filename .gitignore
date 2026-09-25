@@ -1,0 +1,11 @@
+dataset/
+output/
+.venv/
+*.pkl
+*.parquet
+data_mini/
+audit_run.log
+*.log
+__pycache__/
+.DS_Store
+
