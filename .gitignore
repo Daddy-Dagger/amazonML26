@@ -8,4 +8,5 @@ audit_run.log
 *.log
 __pycache__/
 .DS_Store
-
+*.zip
+Hackathon_Paglu_submission.zip
