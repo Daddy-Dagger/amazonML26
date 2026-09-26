@@ -12,14 +12,46 @@ import sys
 import time
 import gc
 import collections
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 
 def get_peak_memory_gb() -> float:
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return usage / (1024.0 ** 3)
+    if resource is not None:
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return usage / (1024.0 ** 3)
+        else:
+            return usage / (1024.0 ** 2)
     else:
-        return usage / (1024.0 ** 2)
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            pid = kernel32.GetCurrentProcessId()
+            h = kernel32.OpenProcess(0x0400 | 0x0010, False, pid)
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ('cb', wintypes.DWORD),
+                    ('PageFaultCount', wintypes.DWORD),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t)
+                ]
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            psapi.GetProcessMemoryInfo(h, ctypes.byref(counters), counters.cb)
+            kernel32.CloseHandle(h)
+            return counters.PeakWorkingSetSize / (1024.0 ** 3)
+        except Exception:
+            return 0.0
 
 def log_msg(msg: str, log_file: str = "run_full_pipeline.log"):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")

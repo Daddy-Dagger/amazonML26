@@ -106,6 +106,115 @@ def log_msg(log_file, msg: str, also_print: bool = False):
         print(formatted)
 
 
+def stream_group_country(
+    s1_ids_list: list,
+    tmp_matches_file: str,
+    tmp_cands_file: str,
+    out_country_matching: str,
+    out_country_cands: str,
+    out_dir: str,
+    country_label: str,
+    log_file: str,
+    num_buckets: int = 16,
+):
+    """
+    Groups matches and candidates in 16 buckets to keep peak memory < 0.7 GB
+    regardless of whether candidate pairs exceed 100M+.
+    """
+    log_msg(log_file, f"[{country_label}] Running streaming bucketed aggregation (num_buckets={num_buckets})...")
+    t0 = time.time()
+    bucket_s1 = [[] for _ in range(num_buckets)]
+    for s1 in s1_ids_list:
+        b = hash(s1) & (num_buckets - 1)
+        bucket_s1[b].append(s1)
+
+    # 1. Group Matches
+    matches_by_s1 = defaultdict(list)
+    total_matches = 0
+    if os.path.exists(tmp_matches_file) and os.path.getsize(tmp_matches_file) > 0:
+        with open(tmp_matches_file, "r", encoding="utf-8") as f:
+            for line in f:
+                tab = line.find("\t")
+                if tab == -1:
+                    continue
+                s1 = line[:tab]
+                m = line[tab + 1 :].rstrip("\r\n")
+                matches_by_s1[s1].append(m)
+                total_matches += 1
+
+    with open(out_country_matching, "w", encoding="utf-8") as f_out:
+        f_out.write("source1_entity_id\tmatched_entity_ids\n")
+        for b in range(num_buckets):
+            for s1 in bucket_s1[b]:
+                m_list = matches_by_s1.get(s1, [])
+                f_out.write(f"{s1}\t{','.join(m_list)}\n")
+    del matches_by_s1
+    gc.collect()
+
+    # 2. Partition Candidates into buckets
+    if os.path.exists(tmp_cands_file) and os.path.getsize(tmp_cands_file) > 0:
+        bucket_files = [
+            open(os.path.join(out_dir, f"tmp_cand_{country_label}_b_{b}.tsv"), "w", buffering=2 * 1024 * 1024, encoding="utf-8")
+            for b in range(num_buckets)
+        ]
+        with open(tmp_cands_file, "r", encoding="utf-8") as f_in:
+            for line in f_in:
+                tab = line.find("\t")
+                if tab == -1:
+                    continue
+                s1 = line[:tab]
+                b = hash(s1) & (num_buckets - 1)
+                bucket_files[b].write(line)
+        for bf in bucket_files:
+            bf.close()
+
+        # 3. Group and write candidate pairs
+        with open(out_country_cands, "w", encoding="utf-8") as f_out:
+            f_out.write("source1_entity_id\tcandidate_entity_ids\n")
+            for b in range(num_buckets):
+                b_path = os.path.join(out_dir, f"tmp_cand_{country_label}_b_{b}.tsv")
+                cands_dict = defaultdict(list)
+                if os.path.exists(b_path):
+                    with open(b_path, "r", encoding="utf-8") as f_b:
+                        for line in f_b:
+                            tab = line.find("\t")
+                            if tab == -1:
+                                continue
+                            s1 = line[:tab]
+                            cand = line[tab + 1 :].rstrip("\r\n")
+                            cands_dict[s1].append(cand)
+                    try:
+                        os.remove(b_path)
+                    except OSError:
+                        pass
+                for s1 in bucket_s1[b]:
+                    c_list = cands_dict.get(s1, [])
+                    if c_list:
+                        deduped = list(dict.fromkeys(c_list))
+                        f_out.write(f"{s1}\t{','.join(deduped)}\n")
+                    else:
+                        f_out.write(f"{s1}\t\n")
+                del cands_dict
+                gc.collect()
+    else:
+        with open(out_country_cands, "w", encoding="utf-8") as f_out:
+            f_out.write("source1_entity_id\tcandidate_entity_ids\n")
+            for s1 in s1_ids_list:
+                f_out.write(f"{s1}\t\n")
+
+    if os.path.exists(tmp_cands_file):
+        try:
+            os.remove(tmp_cands_file)
+        except OSError:
+            pass
+    if os.path.exists(tmp_matches_file):
+        try:
+            os.remove(tmp_matches_file)
+        except OSError:
+            pass
+    log_msg(log_file, f"[{country_label}] Streaming bucketed aggregation done in {time.time()-t0:.2f}s. Peak RAM: {get_peak_memory_gb():.2f} GB")
+
+
 def run_country_pipeline(
     country: str,
     test_dir: str,
@@ -513,60 +622,88 @@ def run_country_pipeline(
         os.remove(tmp_cand_indices_file)
     gc.collect()
 
-    # Step 6: DuckDB Aggregation into per-country TSVs
+    # Step 6: Aggregation into per-country TSVs
     log_msg(log_file, f"[{country}] Step 6: Grouping matches and candidates into per-country TSVs...")
     t_agg = time.time()
     out_country_matching = os.path.join(out_dir, f"tmp_country_matching_{c_tag}.tsv")
     out_country_cands = os.path.join(out_dir, f"tmp_country_cands_{c_tag}.tsv")
 
-    # Table for Country S1
-    con.execute(f"CREATE TABLE country_s1_{c_tag} AS SELECT entity_id FROM read_csv('{test_s1_path}', sep='\\t', header=True, all_varchar=True) WHERE country = ?", [country])
-
-    # Table for Matches (grouped by S1)
-    if os.path.exists(tmp_matches_file) and os.path.getsize(tmp_matches_file) > 0:
-        con.execute(f"""
-            CREATE TABLE country_matches_{c_tag} AS
-            SELECT source1_entity_id, string_agg(matched_id, ',') as matched_ids
-            FROM read_csv('{tmp_matches_file}', sep='\\t', names=['source1_entity_id', 'matched_id'], all_varchar=True)
-            GROUP BY source1_entity_id
-        """)
+    # If candidate pairs exceed 60M, use streaming bucketed aggregation to prevent DuckDB OOM
+    if total_cand_pairs > 60_000_000:
+        stream_group_country(
+            s1_ids_list=s1_ids,
+            tmp_matches_file=tmp_matches_file,
+            tmp_cands_file=tmp_cands_file,
+            out_country_matching=out_country_matching,
+            out_country_cands=out_country_cands,
+            out_dir=out_dir,
+            country_label=c_tag,
+            log_file=log_file,
+            num_buckets=16,
+        )
     else:
-        con.execute(f"CREATE TABLE country_matches_{c_tag} (source1_entity_id VARCHAR, matched_ids VARCHAR)")
+        try:
+            # Table for Country S1
+            con.execute(f"CREATE TABLE country_s1_{c_tag} AS SELECT entity_id FROM read_csv('{test_s1_path}', sep='\\t', header=True, all_varchar=True) WHERE country = ?", [country])
 
-    # Table for Candidates (grouped by S1)
-    if os.path.exists(tmp_cands_file) and os.path.getsize(tmp_cands_file) > 0:
-        con.execute(f"""
-            CREATE TABLE country_cands_{c_tag} AS
-            SELECT source1_entity_id, string_agg(cand_id, ',') as cand_ids
-            FROM read_csv('{tmp_cands_file}', sep='\\t', names=['source1_entity_id', 'cand_id'], all_varchar=True)
-            GROUP BY source1_entity_id
-        """)
-    else:
-        con.execute(f"CREATE TABLE country_cands_{c_tag} (source1_entity_id VARCHAR, cand_ids VARCHAR)")
+            # Table for Matches (grouped by S1)
+            if os.path.exists(tmp_matches_file) and os.path.getsize(tmp_matches_file) > 0:
+                con.execute(f"""
+                    CREATE TABLE country_matches_{c_tag} AS
+                    SELECT source1_entity_id, string_agg(matched_id, ',') as matched_ids
+                    FROM read_csv('{tmp_matches_file}', sep='\\t', names=['source1_entity_id', 'matched_id'], all_varchar=True)
+                    GROUP BY source1_entity_id
+                """)
+            else:
+                con.execute(f"CREATE TABLE country_matches_{c_tag} (source1_entity_id VARCHAR, matched_ids VARCHAR)")
 
-    # Output matching_results_{c_tag}.tsv
-    con.execute(f"""
-        COPY (
-            SELECT s1.entity_id as source1_entity_id, coalesce(m.matched_ids, '') as matched_entity_ids
-            FROM country_s1_{c_tag} s1
-            LEFT JOIN country_matches_{c_tag} m ON s1.entity_id = m.source1_entity_id
-        ) TO '{out_country_matching}' (HEADER, DELIMITER '\\t', QUOTE '')
-    """)
+            # Table for Candidates (grouped by S1)
+            if os.path.exists(tmp_cands_file) and os.path.getsize(tmp_cands_file) > 0:
+                con.execute(f"""
+                    CREATE TABLE country_cands_{c_tag} AS
+                    SELECT source1_entity_id, string_agg(cand_id, ',') as cand_ids
+                    FROM read_csv('{tmp_cands_file}', sep='\\t', names=['source1_entity_id', 'cand_id'], all_varchar=True)
+                    GROUP BY source1_entity_id
+                """)
+            else:
+                con.execute(f"CREATE TABLE country_cands_{c_tag} (source1_entity_id VARCHAR, cand_ids VARCHAR)")
 
-    # Output candidate_pairs_{c_tag}.tsv
-    con.execute(f"""
-        COPY (
-            SELECT s1.entity_id as source1_entity_id, coalesce(c.cand_ids, '') as candidate_entity_ids
-            FROM country_s1_{c_tag} s1
-            LEFT JOIN country_cands_{c_tag} c ON s1.entity_id = c.source1_entity_id
-        ) TO '{out_country_cands}' (HEADER, DELIMITER '\\t', QUOTE '')
-    """)
+            # Output matching_results_{c_tag}.tsv
+            con.execute(f"""
+                COPY (
+                    SELECT s1.entity_id as source1_entity_id, coalesce(m.matched_ids, '') as matched_entity_ids
+                    FROM country_s1_{c_tag} s1
+                    LEFT JOIN country_matches_{c_tag} m ON s1.entity_id = m.source1_entity_id
+                ) TO '{out_country_matching}' (HEADER, DELIMITER '\\t', QUOTE '')
+            """)
 
-    # Clean up intermediate files and tables
-    if os.path.exists(tmp_cands_file):
-        os.remove(tmp_cands_file)
-    if os.path.exists(tmp_matches_file):
-        os.remove(tmp_matches_file)
+            # Output candidate_pairs_{c_tag}.tsv
+            con.execute(f"""
+                COPY (
+                    SELECT s1.entity_id as source1_entity_id, coalesce(c.cand_ids, '') as candidate_entity_ids
+                    FROM country_s1_{c_tag} s1
+                    LEFT JOIN country_cands_{c_tag} c ON s1.entity_id = c.source1_entity_id
+                ) TO '{out_country_cands}' (HEADER, DELIMITER '\\t', QUOTE '')
+            """)
+
+            if os.path.exists(tmp_cands_file):
+                os.remove(tmp_cands_file)
+            if os.path.exists(tmp_matches_file):
+                os.remove(tmp_matches_file)
+
+        except Exception as e:
+            log_msg(log_file, f"[{country}] DuckDB aggregation hit limit ({e}). Falling back to streaming bucketed aggregation...")
+            stream_group_country(
+                s1_ids_list=s1_ids,
+                tmp_matches_file=tmp_matches_file,
+                tmp_cands_file=tmp_cands_file,
+                out_country_matching=out_country_matching,
+                out_country_cands=out_country_cands,
+                out_dir=out_dir,
+                country_label=c_tag,
+                log_file=log_file,
+                num_buckets=16,
+            )
 
     # Compute country stats
     stats_row = con.execute(f"""
