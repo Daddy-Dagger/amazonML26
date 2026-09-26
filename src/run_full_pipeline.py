@@ -96,14 +96,14 @@ def check_memory_safe(max_gb: float = 14.0):
     return peak
 
 
-def log_msg(log_file, msg: str, also_print: bool = False):
+def log_msg(log_file, msg: str, also_print: bool = True):
     """Appends timestamped message to the log file."""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     formatted = f"[{timestamp}] {msg}"
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(formatted + "\n")
     if also_print:
-        print(formatted)
+        print(formatted, flush=True)
 
 
 def stream_group_country(
