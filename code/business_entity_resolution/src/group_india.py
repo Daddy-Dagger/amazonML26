@@ -134,7 +134,7 @@ def main():
                     if tab == -1:
                         continue
                     s1 = line[:tab]
-                    cand = line[tab+1:-1]
+                    cand = line[tab+1:].rstrip("\r\n")
                     cands_dict[s1].append(cand)
                     
             if os.path.exists(b_path):

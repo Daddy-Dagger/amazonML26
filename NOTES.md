@@ -143,3 +143,36 @@
    - Contains exactly 21 items: `output/matching_results.tsv`, `output/candidate_pairs.tsv`, `code/business_entity_resolution/` tree (including pre-trained artifact `model_v2.txt` of 578,983 bytes for direct inference without retraining), and `Documentation_template.md`.
    - Verified via `unzip -l Hackathon_Paglu_submission.zip`. Zero extra files, zero temporary artifacts.
    - Final status: **READY TO UPLOAD**.
+
+## Phase 9: Fresh Environment Synchronization & Setup (Windows Host)
+1. **Repository Synchronization & Dataset Preservation:**
+   - Preserved dataset via temporary backup; safely archived old stale setup into `student_resource_OLD_20260926_1850`.
+   - Freshly cloned GitHub repository `https://github.com/Daddy-Dagger/amazonML26.git` (main branch).
+   - Verified all 11 previously missing pipeline files present (`train_matcher.py`, `run_full_pipeline.py`, reports, etc.).
+   - Restored full `dataset/` (7 TSVs, ~2.5 GB) byte-for-byte into new clone.
+2. **Environment & Testing Verification:**
+   - Configured Python 3.12.13 virtual environment (`.venv`) ensuring binary wheel compatibility for SciPy 1.13.1 on Windows.
+   - Installed all dependencies matching `requirements.txt` (pandas 2.3.3, lightgbm 4.6.0, duckdb 1.4.5, scikit-learn 1.6.1, rapidfuzz 3.13.0, jellyfish 1.2.1, unidecode 1.4.0, pyarrow 21.0.0, scipy 1.13.1).
+   - Ran metric unit tests (`tests/test_metric.py`): 8/8 tests passed including statement example (0.714).
+   - Verified remote git connectivity via read-only `git fetch` (up to date with origin/main).
+
+## Phase 10: Honest Diagnosis, Root Cause Verdict & Threshold Retuning (Step 7)
+1. **Diagnosis at Realistic Scale:**
+   - Sampled 20% stratified train S1 entities (441,365 S1: 176,638 India, 264,727 US) with full candidate pool at real density (100% unmatched distractors retained: 2.68M records across S2 and S3).
+   - Evaluated candidate blocking, pairwise features, and LightGBM `model_v2.txt` scoring.
+   - Discovered severe scale-driven precision collapse: at old mini-world thresholds (`min_p=0.75, min_m=0.00`), pure distractors suffer an 11.72% (US) and 13.04% (India) False Positive acceptance rate, injecting >320,000 false positive matches into the test submission and dropping F0.5 to 0.700.
+2. **Threshold Retuning:**
+   - Grid searched `min_p` (0.50 to 0.99) and `min_m` (0.00 to 0.30) on realistic full-density slice.
+   - Old baseline (`p=0.75, m=0.00`): Precision 85.95%, Recall 98.63%, Macro F0.5 = 0.9012 (1,139 false positives).
+   - Optimal retuned thresholds: `min_p=0.95, min_m=0.05` cuts false positives by 76.4% to 269, achieving Precision 96.16%, Recall 95.32%, and Macro F0.5 = **0.9592** (+0.0580 over old baseline).
+3. **Reactive Scripts & Format Audit:**
+   - Reviewed `group_india.py`, `merge_all.py`, `stream_verify.py`. Confirmed exact row counts (1,732,544 rows), 0 duplicates, 0 dropped records, and strict 1-owner assignment.
+   - Identified and fixed CRLF strip vulnerability in `group_india.py` line 137 (`.rstrip('\r\n')`).
+   - Fixed Windows Git CRLF newline conversion in `code/.../model_v2.txt` that triggered LightGBM model parser fatal error.
+4. **Hardware Utilization Optimizations:**
+   - Explicitly configured `num_threads: 8` for LightGBM across all training/matching scripts.
+   - Added `PRAGMA threads=8` to all DuckDB query connections.
+5. **Verdict & Next Steps:**
+   - Diagnostic report written to `audit/step7_diagnosis_report.md`.
+   - Clear recommendation to rerun full test inference with corrected thresholds (`min_p=0.95, min_m=0.05`).
+

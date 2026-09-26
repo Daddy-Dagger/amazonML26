@@ -23,7 +23,10 @@ import sys
 import gc
 import time
 import math
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 import platform
 import argparse
 import re
@@ -47,15 +50,46 @@ from src.decide_and_score import FEATURE_COLS
 
 
 def get_peak_memory_gb() -> float:
-    """Returns peak resident set size in Gigabytes."""
-    if platform.system() == "Darwin":
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0 * 1024.0)
+    """Returns peak resident set size in Gigabytes cross-platform."""
+    if resource is not None:
+        if platform.system() == "Darwin":
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0 * 1024.0)
+        else:
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
     else:
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            pid = kernel32.GetCurrentProcessId()
+            h = kernel32.OpenProcess(0x0400 | 0x0010, False, pid)
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ('cb', wintypes.DWORD),
+                    ('PageFaultCount', wintypes.DWORD),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t),
+                ]
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                kernel32.CloseHandle(h)
+                return float(pmc.PeakWorkingSetSize) / (1024.0 ** 3)
+            kernel32.CloseHandle(h)
+        except Exception:
+            pass
+        return 0.0
 
 
-def check_memory_safe(max_gb: float = 6.8):
-    """Safety check to ensure memory usage stays well below the 7GB limit."""
+def check_memory_safe(max_gb: float = 14.0):
+    """Safety check to ensure memory usage stays well below the 14GB limit on a 16GB host."""
     peak = get_peak_memory_gb()
     if peak >= max_gb:
         raise MemoryError(f"CRITICAL: Memory usage approached {peak:.2f} GB (>= {max_gb:.2f} GB limit). Halting pipeline.")
@@ -79,8 +113,8 @@ def run_country_pipeline(
     idf_weights_path: str,
     out_dir: str,
     log_file: str,
-    min_p: float = 0.75,
-    min_m: float = 0.00,
+    min_p: float = 0.95,
+    min_m: float = 0.05,
     chunk_size: int = 50000,
     sub_batch_size: int = 2000,
     max_cands_per_rec: int = 25,
@@ -100,6 +134,7 @@ def run_country_pipeline(
     log_msg(log_file, f"============================================================")
 
     con = duckdb.connect()
+    con.execute("PRAGMA threads=8")
     test_s1_path = os.path.join(test_dir, "test_source1.tsv")
     test_s2_path = os.path.join(test_dir, "test_source2.tsv")
     test_s3_path = os.path.join(test_dir, "test_source3.tsv")
@@ -149,22 +184,15 @@ def run_country_pipeline(
     vec_blocking = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=3, max_df=max_char_df)
     X_s1_blocking = vec_blocking.fit_transform(s1_nf_strs)
 
-    # Generator (b): inverted index on name_core tokens
-    inv_b = defaultdict(list)
-    for idx, c in enumerate(s1_core):
-        for t in set(c):
-            inv_b[t].append(idx)
+    # Generator (b): vectorized TF-IDF on name_core tokens
+    s1_core_strs = [" ".join(c) for c in s1_core]
+    vec_b = TfidfVectorizer(analyzer="word", token_pattern=r"\S+", min_df=1)
+    X_s1_b = vec_b.fit_transform(s1_core_strs)
 
-    # Generator (c): inverted index on address tokens
-    df_addr = Counter()
-    for a in s1_addrs:
-        df_addr.update(set(a))
-    idf_addr = {t: math.log((n_s1 + 1.0) / (cnt + 1.0)) + 1.0 for t, cnt in df_addr.items() if cnt <= 2000}
-    inv_c = defaultdict(list)
-    for idx, a in enumerate(s1_addrs):
-        for t in set(a):
-            if t in idf_addr:
-                inv_c[t].append(idx)
+    # Generator (c): vectorized TF-IDF on address tokens with max_df=2000
+    s1_addr_strs = [" ".join(a) for a in s1_addrs]
+    vec_c = TfidfVectorizer(analyzer="word", token_pattern=r"\S+", min_df=1, max_df=min(2000, n_s1))
+    X_s1_c = vec_c.fit_transform(s1_addr_strs)
 
     # Feature cache for fast pairwise evaluation
     vec_feat = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), min_df=1)
@@ -187,7 +215,7 @@ def run_country_pipeline(
     tmp_cand_indices_file = os.path.join(out_dir, f"tmp_indices_{c_tag}.txt")
 
     # Step 4: PASS 1 - Candidate Blocking across S2 and S3
-    log_msg(log_file, f"[{country}] Step 4: PASS 1 - Generating candidates from S2 and S3...")
+    log_msg(log_file, f"[{country}] Step 4: PASS 1 - Generating candidates from S2 and S3 (Vectorized)...")
     t_pass1 = time.time()
     cand_counts = np.zeros(n_s1, dtype=np.int32)
     total_queries = 0
@@ -215,61 +243,59 @@ def run_country_pipeline(
                 q_addrs = [normalize_text(r[2], is_address=True) for r in rows]
                 q_core = [[t for t in n if t not in generic_set] for n in q_names]
                 q_nf_strs = [" ".join(n) for n in q_names]
+                q_core_strs = [" ".join(c) for c in q_core]
+                q_addr_strs = [" ".join(a) for a in q_addrs]
 
                 cand_buffer = []
                 idx_buffer = []
 
-                # Sub-batch sparse TF-IDF matrix multiplication
+                # Sub-batch sparse TF-IDF matrix multiplication across all 3 generators
                 for sb_start in range(0, n_rows, sub_batch_size):
                     sb_end = min(sb_start + sub_batch_size, n_rows)
                     sub_q_strs = q_nf_strs[sb_start:sb_end]
-                    X_q_sub = vec_blocking.transform(sub_q_strs)
-                    sims_sub = (X_q_sub @ X_s1_blocking.T).tocsr()
+                    sub_q_core_strs = q_core_strs[sb_start:sb_end]
+                    sub_q_addr_strs = q_addr_strs[sb_start:sb_end]
+
+                    sims_sub = (vec_blocking.transform(sub_q_strs) @ X_s1_blocking.T).tocsr()
+                    sims_b = (vec_b.transform(sub_q_core_strs) @ X_s1_b.T).tocsr()
+                    sims_c = (vec_c.transform(sub_q_addr_strs) @ X_s1_c.T).tocsr()
 
                     for i_rel, i_abs in enumerate(range(sb_start, sb_end)):
                         cand_gens = {}
                         cand_scores = {}
 
                         # Generator (a): char 3-gram cosine
-                        row_data = sims_sub.data[sims_sub.indptr[i_rel] : sims_sub.indptr[i_rel + 1]]
-                        row_indices = sims_sub.indices[sims_sub.indptr[i_rel] : sims_sub.indptr[i_rel + 1]]
-                        if len(row_data) > 0:
-                            top_k = min(15, len(row_data))
-                            top_sub = np.argsort(-row_data)[:top_k]
+                        row_data_a = sims_sub.data[sims_sub.indptr[i_rel] : sims_sub.indptr[i_rel + 1]]
+                        row_indices_a = sims_sub.indices[sims_sub.indptr[i_rel] : sims_sub.indptr[i_rel + 1]]
+                        if len(row_data_a) > 0:
+                            top_k = min(15, len(row_data_a))
+                            top_sub = np.argsort(-row_data_a)[:top_k]
                             for rank, sub_idx in enumerate(top_sub):
-                                c_idx = int(row_indices[sub_idx])
+                                c_idx = int(row_indices_a[sub_idx])
                                 cand_gens[c_idx] = 1
                                 cand_scores[c_idx] = (15 - rank) / 15.0
 
-                        # Generator (b): core tokens inverted index
-                        q_c = q_core[i_abs]
-                        if q_c:
-                            scores_b = {}
-                            for t in set(q_c):
-                                w = idf_map.get(t, 1.0)
-                                if w > 0 and t in inv_b:
-                                    for c_idx in inv_b[t]:
-                                        scores_b[c_idx] = scores_b.get(c_idx, 0.0) + w
-                            if scores_b:
-                                top_b = sorted(scores_b.items(), key=lambda x: -x[1])[:15]
-                                for rank, (c_idx, _) in enumerate(top_b):
-                                    cand_gens[c_idx] = cand_gens.get(c_idx, 0) + 1
-                                    cand_scores[c_idx] = cand_scores.get(c_idx, 0.0) + (15 - rank) / 15.0
+                        # Generator (b): vectorized core tokens TF-IDF
+                        row_data_b = sims_b.data[sims_b.indptr[i_rel] : sims_b.indptr[i_rel + 1]]
+                        row_indices_b = sims_b.indices[sims_b.indptr[i_rel] : sims_b.indptr[i_rel + 1]]
+                        if len(row_data_b) > 0:
+                            top_k = min(15, len(row_data_b))
+                            top_sub = np.argsort(-row_data_b)[:top_k]
+                            for rank, sub_idx in enumerate(top_sub):
+                                c_idx = int(row_indices_b[sub_idx])
+                                cand_gens[c_idx] = cand_gens.get(c_idx, 0) + 1
+                                cand_scores[c_idx] = cand_scores.get(c_idx, 0.0) + (15 - rank) / 15.0
 
-                        # Generator (c): address tokens inverted index
-                        q_a = q_addrs[i_abs]
-                        if q_a:
-                            scores_c = {}
-                            for t in set(q_a):
-                                w = idf_addr.get(t)
-                                if w is not None and t in inv_c:
-                                    for c_idx in inv_c[t]:
-                                        scores_c[c_idx] = scores_c.get(c_idx, 0.0) + w
-                            if scores_c:
-                                top_c = sorted(scores_c.items(), key=lambda x: -x[1])[:10]
-                                for rank, (c_idx, _) in enumerate(top_c):
-                                    cand_gens[c_idx] = cand_gens.get(c_idx, 0) + 1
-                                    cand_scores[c_idx] = cand_scores.get(c_idx, 0.0) + (10 - rank) / 10.0
+                        # Generator (c): vectorized address tokens TF-IDF
+                        row_data_c = sims_c.data[sims_c.indptr[i_rel] : sims_c.indptr[i_rel + 1]]
+                        row_indices_c = sims_c.indices[sims_c.indptr[i_rel] : sims_c.indptr[i_rel + 1]]
+                        if len(row_data_c) > 0:
+                            top_k = min(10, len(row_data_c))
+                            top_sub = np.argsort(-row_data_c)[:top_k]
+                            for rank, sub_idx in enumerate(top_sub):
+                                c_idx = int(row_indices_c[sub_idx])
+                                cand_gens[c_idx] = cand_gens.get(c_idx, 0) + 1
+                                cand_scores[c_idx] = cand_scores.get(c_idx, 0.0) + (10 - rank) / 10.0
 
                         # Combine, sort, cap at max_cands_per_rec
                         if cand_gens:
@@ -301,7 +327,7 @@ def run_country_pipeline(
     )
 
     # Free blocking structures not needed in Pass 2
-    del X_s1_blocking, vec_blocking, inv_b, inv_c, df_addr, idf_addr
+    del X_s1_blocking, vec_blocking, X_s1_b, vec_b, X_s1_c, vec_c
     gc.collect()
 
     # Step 5: PASS 2 - Feature Extraction, Batch Model Scoring & 1-Owner Decision Layer
@@ -614,6 +640,7 @@ def merge_country_results(
 
     t0 = time.time()
     con = duckdb.connect()
+    con.execute("PRAGMA threads=8")
     test_s1_path = os.path.join(test_dir, "test_source1.tsv")
     final_matching_path = os.path.join(out_dir, "matching_results.tsv")
     final_cands_path = os.path.join(out_dir, "candidate_pairs.tsv")
@@ -662,13 +689,13 @@ def merge_country_results(
 def main():
     parser = argparse.ArgumentParser(description="Full Test Submission Pipeline for Entity Resolution.")
     parser.add_argument("--test-dir", type=str, default="dataset/test", help="Path to test directory")
-    parser.add_argument("--model", type=str, default="data_mini/model_v2.txt", help="Path to LightGBM model file")
+    parser.add_argument("--model", type=str, default="code/business_entity_resolution/model_v2.txt", help="Path to LightGBM model file")
     parser.add_argument("--out-dir", type=str, default="output", help="Directory to save submission files")
     parser.add_argument("--idf-path", type=str, default="data_mini/idf_weights.parquet", help="Path to precomputed IDF weights")
-    parser.add_argument("--min-p", type=float, default=0.75, help="Decision threshold min_probability (default: 0.75)")
-    parser.add_argument("--min-m", type=float, default=0.00, help="Decision threshold min_margin (default: 0.00)")
+    parser.add_argument("--min-p", type=float, default=0.95, help="Decision threshold min_probability (default: 0.95)")
+    parser.add_argument("--min-m", type=float, default=0.05, help="Decision threshold min_margin (default: 0.05)")
     parser.add_argument("--chunk-size", type=int, default=50000, help="Query record chunk size (default: 50000)")
-    parser.add_argument("--log-file", type=str, default="run_full_pipeline.log", help="Log file path")
+    parser.add_argument("--log-file", type=str, default="run_full_pipeline_v2.log", help="Log file path")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -678,7 +705,7 @@ def main():
     with open(args.log_file, "w", encoding="utf-8") as f:
         f.write(f"=== FULL PIPELINE RUN: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
-    log_msg(args.log_file, f"Platform: {platform.system()} {platform.machine()}, 8 cores, 8GB RAM")
+    log_msg(args.log_file, f"Platform: {platform.system()} {platform.machine()}, 8 physical cores, 16GB RAM")
     log_msg(args.log_file, f"Args: test_dir={args.test_dir}, model={args.model}, out_dir={args.out_dir}")
     log_msg(args.log_file, f"Thresholds: min_p={args.min_p}, min_m={args.min_m}, chunk_size={args.chunk_size}")
 
@@ -687,10 +714,12 @@ def main():
         raise FileNotFoundError(f"Model file not found: {args.model}")
     log_msg(args.log_file, f"Loading LightGBM model from {args.model}...")
     model = lgb.Booster(model_file=args.model)
+    model.params["num_threads"] = 8
 
     # Discover countries dynamically from test_source1.tsv
     test_s1_path = os.path.join(args.test_dir, "test_source1.tsv")
     con = duckdb.connect()
+    con.execute("PRAGMA threads=8")
     country_counts = con.execute(
         f"SELECT country, count(*) FROM read_csv('{test_s1_path}', sep='\\t', header=True, all_varchar=True) GROUP BY country ORDER BY count(*) ASC"
     ).fetchall()

@@ -4,6 +4,7 @@ output/
 *.pkl
 *.parquet
 data_mini/
+data_diag/
 audit_run.log
 *.log
 __pycache__/

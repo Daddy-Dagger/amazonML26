@@ -55,7 +55,7 @@ def train_model(
     colsample_bytree: float = 0.8,
     n_estimators: int = 300,
     early_stopping_rounds: int = 25,
-    n_jobs: int = 6,
+    n_jobs: int = 8,
     seed: int = 42,
 ):
     t_start = time.time()
@@ -114,7 +114,7 @@ def train_model(
         "subsample": subsample,
         "subsample_freq": 1,
         "colsample_bytree": colsample_bytree,
-        "n_jobs": n_jobs,
+        "num_threads": n_jobs,
         "verbosity": -1,
         "random_state": seed,
     }
@@ -180,7 +180,7 @@ def main():
     parser.add_argument("--min-child-samples", type=int, default=50)
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--early-stopping", type=int, default=25)
-    parser.add_argument("--n-jobs", type=int, default=6)
+    parser.add_argument("--n-jobs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
